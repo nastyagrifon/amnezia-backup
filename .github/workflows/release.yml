@@ -1,8 +1,17 @@
-name: Build Packages
+name: Build and Release Packages
 
 on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
   release:
     types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-packages:
@@ -19,10 +28,11 @@ jobs:
 
       - name: Build Packages
         run: |
-          # Извлекаем версию из тега (например, v1.0.1 -> 1.0.1)
-          VERSION=${GITHUB_REF_NAME#v}
+          RAW_VERSION=${GITHUB_REF_NAME#v}
+          VERSION=$([ "$RAW_VERSION" == "main" ] || [ -z "$RAW_VERSION" ] && echo "0.0.1" || echo "$RAW_VERSION")
           
-          # Список форматов для сборки
+          echo "Building version: $VERSION"
+          
           FORMATS=("deb" "rpm" "pacman")
           
           for FMT in "${FORMATS[@]}"; do
@@ -38,6 +48,7 @@ jobs:
 
       - name: Upload Artifacts to Release
         uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
         with:
           files: |
             *.deb
