@@ -46,6 +46,8 @@ CONSISTENT_BACKUP=true ./amnezia-backup.sh
 - **Cleanup**: Automatic cleanup of temporary files on script exit/interruption.
 - **Retention**: Automatically keeps only the most recent backups.
 - **Dependency Checks**: Verifies `docker` and `tar` are installed.
+- **Consistent Backups**: Added option to pause containers during backup for better data integrity.
+- **Restore Safety**: Automatically creates a "pre-restore" safety backup before modifying container files. If restore fails, your data remains safe.
 
 ## Important
 

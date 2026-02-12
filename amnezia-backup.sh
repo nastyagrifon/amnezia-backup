@@ -54,7 +54,8 @@ is_blacklisted() {
 # Function to perform the actual /opt/ backup for a single container
 backup_container_opt() {
     local CONTAINER_NAME="$1"
-    local BACKUP_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$DATE_SUFFIX.tar.gz"
+    local SUFFIX="${2:-$DATE_SUFFIX}"
+    local BACKUP_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$SUFFIX.tar.gz"
     local TMP_BACKUP_FILE="$BACKUP_FILE.tmp"
     local PAUSED=false
     
@@ -71,7 +72,7 @@ backup_container_opt() {
     fi
 
     # 2. Create temporary directory for extraction
-    local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/${CONTAINER_NAME}_$DATE_SUFFIX"
+    local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/${CONTAINER_NAME}_$SUFFIX"
     mkdir -p "$CONTAINER_TEMP_DIR"
     
     # 3. Copy /opt/ out of the container
@@ -105,12 +106,15 @@ backup_container_opt() {
     # 5. Clean up container-specific temp dir
     rm -rf "$CONTAINER_TEMP_DIR"
 
-    # 6. Apply retention policy
-    local BACKUP_PATTERN="$BACKUP_DIR/$CONTAINER_NAME-opt-*.tar.gz"
-    local OLD_BACKUPS=$(ls -t $BACKUP_PATTERN 2>/dev/null | tail -n +$((RETENTION_COUNT + 1)))
-    if [[ -n "$OLD_BACKUPS" ]]; then
-        echo "  Cleaning up old backups (keeping last $RETENTION_COUNT)..."
-        rm -f $OLD_BACKUPS
+    # 6. Apply retention policy (only for regular backups)
+    if [[ "$SUFFIX" == "$DATE_SUFFIX" ]]; then
+        local BACKUP_PATTERN="$BACKUP_DIR/$CONTAINER_NAME-opt-*.tar.gz"
+        # Filter out rollback backups from retention policy to be safe
+        local OLD_BACKUPS=$(ls -t $BACKUP_PATTERN 2>/dev/null | grep -v "pre-restore" | tail -n +$((RETENTION_COUNT + 1)))
+        if [[ -n "$OLD_BACKUPS" ]]; then
+            echo "  Cleaning up old backups (keeping last $RETENTION_COUNT)..."
+            rm -f $OLD_BACKUPS
+        fi
     fi
 
     echo "  SUCCESS: Backup saved to $BACKUP_FILE"
@@ -122,7 +126,7 @@ backup_container_opt() {
 restore_container_opt() {
     local CONTAINER_NAME="$1"
     
-    local LATEST_BACKUP=$(ls -t "$BACKUP_DIR/$CONTAINER_NAME"-opt-*.tar.gz 2>/dev/null | head -n 1)
+    local LATEST_BACKUP=$(ls -t "$BACKUP_DIR/$CONTAINER_NAME"-opt-*.tar.gz 2>/dev/null | grep -v "pre-restore" | head -n 1)
 
     if [[ -z "$LATEST_BACKUP" ]]; then
         echo "ERROR: No /opt/ backup found for $CONTAINER_NAME in $BACKUP_DIR. Skipping restore."
@@ -132,8 +136,17 @@ restore_container_opt() {
 
     echo "--- Starting in-place /opt/ restore for $CONTAINER_NAME from $(basename "$LATEST_BACKUP") ---"
     
+    # 1. Create Safety Backup before modification
+    local ROLLBACK_SUFFIX="pre-restore-$DATE_SUFFIX"
+    local ROLLBACK_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$ROLLBACK_SUFFIX.tar.gz"
+    echo "  Creating safety backup..."
+    if ! backup_container_opt "$CONTAINER_NAME" "$ROLLBACK_SUFFIX" &>/dev/null; then
+        echo "  ERROR: Failed to create safety backup. Aborting restore to prevent data loss."
+        ((FAILURES++))
+        return 1
+    fi
+
     # TODO: Implement clean restores by wiping /opt/ in the container first.
-    # TODO: Implement rollback if restore fails.
 
     local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/restore_${CONTAINER_NAME}_$DATE_SUFFIX"
     mkdir -p "$CONTAINER_TEMP_DIR"
@@ -148,6 +161,7 @@ restore_container_opt() {
     echo "  Unpacking archive..."
     if ! tar xzf "$LATEST_BACKUP" -C "$CONTAINER_TEMP_DIR"; then
         echo "  ERROR: Failed to unpack backup. Aborting."
+        echo "  ROLLBACK INFO: Your data is safe in $ROLLBACK_FILE"
         docker start "$CONTAINER_NAME" 2>/dev/null
         ((FAILURES++))
         return 1
@@ -158,6 +172,7 @@ restore_container_opt() {
         echo "  SUCCESS: /opt/ content updated."
     else
         echo "  ERROR: docker cp failed. Manual check required."
+        echo "  ROLLBACK REQUIRED: Use $ROLLBACK_FILE to restore manually."
         ((FAILURES++))
     fi
     
@@ -172,6 +187,7 @@ restore_container_opt() {
     fi
     
     echo "SUCCESS: Container restored and restarted."
+    echo "  Note: Safety backup kept at $ROLLBACK_FILE"
     echo "--------------------------------------------------------"
     return 0
 }
