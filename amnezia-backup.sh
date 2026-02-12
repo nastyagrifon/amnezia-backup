@@ -1,31 +1,65 @@
 #!/bin/bash
 
-# Argument Parsing
+# --- Default Configuration ---
 RESTORE_MODE=false
+DRY_RUN=false
+VERBOSE=false
 PROVIDED_DIR=""
-
-for arg in "$@"; do
-    if [[ "$arg" == "-r" ]]; then
-        RESTORE_MODE=true
-    elif [[ -z "$PROVIDED_DIR" ]]; then
-        PROVIDED_DIR="$arg"
-    fi
-done
-
-# Configuration
-if [[ -n "$PROVIDED_DIR" ]]; then
-    # Create directory if it doesn't exist so we can get absolute path
-    mkdir -p "$PROVIDED_DIR"
-    BACKUP_DIR="$(cd "$PROVIDED_DIR" && pwd)"
-else
-    BACKUP_DIR="$(pwd)"
-fi
-
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-amnezia}"
 DATE_SUFFIX=$(date +%Y%m%d_%H%M%S)
 RETENTION_COUNT="${RETENTION_COUNT:-5}"
 ROLLBACK_RETENTION_COUNT="${ROLLBACK_RETENTION_COUNT:-2}"
 CONSISTENT_BACKUP="${CONSISTENT_BACKUP:-false}"
+
+# --- Helper Functions ---
+
+show_help() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS] [BACKUP_DIR]
+
+Backs up or restores /opt/ directories of Amnezia VPN containers.
+
+Options:
+  -r           Restore mode (default is backup mode)
+  -n           Dry run: show what would happen without making changes
+  -v           Verbose mode: show more detailed output
+  -h, --help   Show this help message
+
+Arguments:
+  BACKUP_DIR   Directory to store/read backups (default: current directory)
+
+Environment Variables:
+  CONTAINER_PREFIX           Prefix of containers to target (default: amnezia)
+  RETENTION_COUNT            Number of regular backups to keep (default: 5)
+  ROLLBACK_RETENTION_COUNT   Number of safety backups to keep (default: 2)
+  CONSISTENT_BACKUP          Set to "true" to pause container during backup
+
+Examples:
+  $(basename "$0") /mnt/backups
+  $(basename "$0") -r /mnt/backups
+  CONSISTENT_BACKUP=true $(basename "$0") -v
+EOF
+}
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -r) RESTORE_MODE=true; shift ;;
+        -n) DRY_RUN=true; shift ;;
+        -v) VERBOSE=true; shift ;;
+        -h|--help) show_help; exit 0 ;;
+        -*) echo "Unknown option: $1"; show_help; exit 1 ;;
+        *) PROVIDED_DIR="$1"; shift ;;
+    esac
+done
+
+# Resolve Backup Directory
+if [[ -n "$PROVIDED_DIR" ]]; then
+    mkdir -p "$PROVIDED_DIR" || { echo "ERROR: Could not create directory $PROVIDED_DIR"; exit 1; }
+    BACKUP_DIR="$(cd "$PROVIDED_DIR" && pwd)"
+else
+    BACKUP_DIR="$(pwd)"
+fi
 
 # --- BLACKLIST: Containers to be excluded from backup and restore ---
 # Only 'amnezia-dns' is blacklisted as per request.
@@ -36,8 +70,18 @@ FAILURES=0
 
 # --- Helper Functions ---
 
+log_v() {
+    [[ "$VERBOSE" == "true" ]] && echo "  [DEBUG] $*"
+}
+
+# Get container state (running, paused, exited, etc.)
+get_container_state() {
+    docker inspect --format '{{.State.Status}}' "$1" 2>/dev/null
+}
+
 # Check dependencies
 check_dependencies() {
+    log_v "Checking dependencies..."
     for cmd in docker tar awk df; do
         if ! command -v "$cmd" &> /dev/null; then
             echo "ERROR: Required command '$cmd' not found. Please install it."
@@ -117,16 +161,26 @@ backup_container_opt() {
     
     echo "--- Starting /opt/ backup for $CONTAINER_NAME ---"
     
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  [DRY RUN] Would backup $CONTAINER_NAME to $BACKUP_FILE"
+        return 0
+    fi
+
     # Check disk space before starting each backup
     check_disk_space
 
     # 1. Handle consistency if requested
     if [[ "$CONSISTENT_BACKUP" == "true" ]]; then
-        echo "  Pausing container for consistency..."
-        if docker pause "$CONTAINER_NAME" &>/dev/null; then
-            PAUSED=true
+        local CURRENT_STATE=$(get_container_state "$CONTAINER_NAME")
+        if [[ "$CURRENT_STATE" == "running" ]]; then
+            echo "  Pausing container for consistency..."
+            if docker pause "$CONTAINER_NAME" &>/dev/null; then
+                PAUSED=true
+            else
+                echo "  WARNING: Failed to pause $CONTAINER_NAME. Proceeding with live backup."
+            fi
         else
-            echo "  WARNING: Failed to pause $CONTAINER_NAME. Proceeding with live backup."
+            log_v "Container $CONTAINER_NAME is in state '$CURRENT_STATE', skipping pause."
         fi
     fi
 
@@ -136,6 +190,7 @@ backup_container_opt() {
     
     # 3. Copy /opt/ out of the container
     echo "  Copying /opt/ from container..."
+    log_v "Running: docker cp $CONTAINER_NAME:/opt/ $CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt"
     if ! docker cp "$CONTAINER_NAME":/opt/ "$CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to copy /opt/ using docker cp. Skipping."
         [[ "$PAUSED" == "true" ]] && docker unpause "$CONTAINER_NAME" &>/dev/null
@@ -151,6 +206,7 @@ backup_container_opt() {
 
     # 5. Compress the copied /opt/ directory into a single tar.gz
     echo "  Compressing into $BACKUP_FILE..."
+    log_v "Running: tar czf $TMP_BACKUP_FILE -C $CONTAINER_TEMP_DIR ${CONTAINER_NAME}_opt"
     if ! tar czf "$TMP_BACKUP_FILE" -C "$CONTAINER_TEMP_DIR" "${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to create tar.gz archive. Skipping."
         rm -f "$TMP_BACKUP_FILE"
@@ -159,6 +215,7 @@ backup_container_opt() {
     fi
 
     # 4. Finalize backup (Atomic move and secure permissions)
+    log_v "Finalizing backup file..."
     mv "$TMP_BACKUP_FILE" "$BACKUP_FILE"
     chmod 600 "$BACKUP_FILE"
     
@@ -177,6 +234,7 @@ backup_container_opt() {
 restore_container_opt() {
     local CONTAINER_NAME="$1"
     
+    # Robust file selection: find latest regular backup (exclude pre-restore)
     local LATEST_BACKUP=$(ls -t "$BACKUP_DIR/$CONTAINER_NAME"-opt-*.tar.gz 2>/dev/null | grep -v "pre-restore" | head -n 1)
 
     if [[ -z "$LATEST_BACKUP" ]]; then
@@ -187,6 +245,15 @@ restore_container_opt() {
 
     echo "--- Starting in-place /opt/ restore for $CONTAINER_NAME from $(basename "$LATEST_BACKUP") ---"
     
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo "  [DRY RUN] Would restore $CONTAINER_NAME from $LATEST_BACKUP"
+        return 0
+    fi
+
+    # Record initial state
+    local INITIAL_STATE=$(get_container_state "$CONTAINER_NAME")
+    log_v "Initial state of $CONTAINER_NAME: $INITIAL_STATE"
+
     # 1. Create Safety Backup before modification
     local ROLLBACK_SUFFIX="pre-restore-$DATE_SUFFIX"
     local ROLLBACK_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$ROLLBACK_SUFFIX.tar.gz"
@@ -197,28 +264,38 @@ restore_container_opt() {
         return 1
     fi
 
-    # TODO: Implement clean restores by wiping /opt/ in the container first.
+    # TODO: Implement clean restores. Currently, 'docker cp' merges files.
+    # A clean restore would involve:
+    # 1. docker run --rm -v container_opt:/target alpine sh -c "rm -rf /target/*"
+    # (requires identifying the correct volume or mount point)
 
     local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/restore_${CONTAINER_NAME}_$DATE_SUFFIX"
     mkdir -p "$CONTAINER_TEMP_DIR"
     
-    echo "  Stopping container..."
-    if ! docker stop "$CONTAINER_NAME"; then
-        echo "  ERROR: Failed to stop $CONTAINER_NAME. Aborting restore."
-        ((FAILURES++))
-        return 1
+    # 2. Stop container if it's running/paused
+    if [[ "$INITIAL_STATE" == "running" || "$INITIAL_STATE" == "paused" ]]; then
+        echo "  Stopping container..."
+        if ! docker stop "$CONTAINER_NAME"; then
+            echo "  ERROR: Failed to stop $CONTAINER_NAME. Aborting restore."
+            ((FAILURES++))
+            return 1
+        fi
+    else
+        log_v "Container is not running ($INITIAL_STATE), skipping stop."
     fi
     
+    # 3. Unpack and copy
     echo "  Unpacking archive..."
     if ! tar xzf "$LATEST_BACKUP" -C "$CONTAINER_TEMP_DIR"; then
         echo "  ERROR: Failed to unpack backup. Aborting."
         echo "  ROLLBACK INFO: Your data is safe in $ROLLBACK_FILE"
-        docker start "$CONTAINER_NAME" 2>/dev/null
+        [[ "$INITIAL_STATE" == "running" ]] && docker start "$CONTAINER_NAME" 2>/dev/null
         ((FAILURES++))
         return 1
     fi
     
     echo "  Copying /opt/ content back into container..."
+    log_v "Running: docker cp $CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt/. $CONTAINER_NAME:/opt/"
     if docker cp "$CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt/." "$CONTAINER_NAME:/opt/"; then
         echo "  SUCCESS: /opt/ content updated."
     else
@@ -230,14 +307,19 @@ restore_container_opt() {
     # Clean up container-specific temp dir
     rm -rf "$CONTAINER_TEMP_DIR"
     
-    echo "  Starting container..."
-    if ! docker start "$CONTAINER_NAME"; then
-        echo "  WARNING: Failed to start $CONTAINER_NAME. Manual check required."
-        ((FAILURES++))
-        return 1
+    # 4. Restore initial state
+    if [[ "$INITIAL_STATE" == "running" ]]; then
+        echo "  Starting container..."
+        if ! docker start "$CONTAINER_NAME"; then
+            echo "  WARNING: Failed to start $CONTAINER_NAME. Manual check required."
+            ((FAILURES++))
+            return 1
+        fi
+    else
+        log_v "Preserving initial state ($INITIAL_STATE), not starting container."
     fi
     
-    echo "SUCCESS: Container restored and restarted."
+    echo "SUCCESS: Container restored."
     echo "  Note: Safety backup kept at $ROLLBACK_FILE"
     echo "--------------------------------------------------------"
     return 0
@@ -268,6 +350,7 @@ if [[ "$RESTORE_MODE" == "true" ]]; then
     # RESTORE MODE
     echo "--- Amnezia Docker Restore Mode (Simplified /opt/ Restore) ---"
     echo "Backup Directory: $BACKUP_DIR"
+    [[ "$DRY_RUN" == "true" ]] && echo "[DRY RUN ENABLED] No changes will be made."
     echo "Containers to restore (excluding: ${BLACKLIST[*]}):"
     printf " - %s\n" "${FILTERED_NAMES_ARRAY[@]}"
     echo "--------------------------------------------------------"
@@ -279,6 +362,7 @@ else
     # BACKUP MODE (Default)
     echo "--- Amnezia Docker Backup Mode (Simplified /opt/ Backup) ---"
     echo "Backup Directory: $BACKUP_DIR"
+    [[ "$DRY_RUN" == "true" ]] && echo "[DRY RUN ENABLED] No changes will be made."
     mkdir -p "$BACKUP_DIR"
     echo "Containers to backup (excluding: ${BLACKLIST[*]}):"
     printf " - %s\n" "${FILTERED_NAMES_ARRAY[@]}"
