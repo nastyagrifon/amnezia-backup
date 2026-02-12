@@ -25,9 +25,26 @@ Backs up and restores your Amnezia VPN containers.
 - This script file
 - Enough disk space for backups
 
-## Where backups go
+## Configuration
 
-Backups are saved in a directory `./amnezia_opt_backups/`
+You can override the default settings using environment variables:
+
+- `BACKUP_DIR`: Path to save backups (default: `./amnezia_opt_backups`)
+- `CONTAINER_PREFIX`: Prefix of containers to backup (default: `amnezia`)
+- `RETENTION_COUNT`: Number of old backups to keep (default: `5`)
+
+Example:
+```bash
+BACKUP_DIR="/mnt/backups" RETENTION_COUNT=10 ./amnezia-backup.sh
+```
+
+## Features
+
+- **Atomic Backups**: Backups are written to temporary files and moved only when complete.
+- **Secure Permissions**: Backup files are created with restricted permissions (600).
+- **Cleanup**: Automatic cleanup of temporary files on script exit/interruption.
+- **Retention**: Automatically keeps only the most recent backups.
+- **Dependency Checks**: Verifies `docker` and `tar` are installed.
 
 ## Important
 

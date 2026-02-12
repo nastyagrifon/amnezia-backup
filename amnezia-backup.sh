@@ -1,15 +1,43 @@
 #!/bin/bash
 
 # Configuration
-BACKUP_DIR="./amnezia_opt_backups"
-CONTAINER_PREFIX="amnezia"
+BACKUP_DIR="${BACKUP_DIR:-./amnezia_opt_backups}"
+CONTAINER_PREFIX="${CONTAINER_PREFIX:-amnezia}"
 DATE_SUFFIX=$(date +%Y%m%d_%H%M%S)
+RETENTION_COUNT="${RETENTION_COUNT:-5}"
 
 # --- BLACKLIST: Containers to be excluded from backup and restore ---
 # Only 'amnezia-dns' is blacklisted as per request.
 BLACKLIST=("amnezia-dns")
 
+# Track failures for exit code
+FAILURES=0
+
 # --- Helper Functions ---
+
+# Check dependencies
+check_dependencies() {
+    for cmd in docker tar; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo "ERROR: Required command '$cmd' not found. Please install it."
+            exit 1
+        fi
+    done
+}
+
+# Cleanup on exit
+cleanup() {
+    if [[ -n "$SCRIPT_TEMP_DIR" && -d "$SCRIPT_TEMP_DIR" ]]; then
+        rm -rf "$SCRIPT_TEMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# Initialize script-wide temp dir
+SCRIPT_TEMP_DIR=$(mktemp -d)
+
+# Check dependencies before starting
+check_dependencies
 
 # Check if a container name is in the blacklist
 is_blacklisted() {
@@ -26,30 +54,49 @@ is_blacklisted() {
 backup_container_opt() {
     local CONTAINER_NAME="$1"
     local BACKUP_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$DATE_SUFFIX.tar.gz"
+    local TMP_BACKUP_FILE="$BACKUP_FILE.tmp"
     
     echo "--- Starting /opt/ backup for $CONTAINER_NAME ---"
     
+    # TODO: Implement consistent backups by pausing/stopping the container
+    # during the copy if data integrity is critical.
+
     # 1. Create temporary directory for extraction
-    local TEMP_DIR=$(mktemp -d)
+    local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/${CONTAINER_NAME}_$DATE_SUFFIX"
+    mkdir -p "$CONTAINER_TEMP_DIR"
     
     # 2. Copy /opt/ out of the container
     echo "  Copying /opt/ from container..."
-    if ! docker cp "$CONTAINER_NAME":/opt/ "$TEMP_DIR/${CONTAINER_NAME}_opt"; then
+    if ! docker cp "$CONTAINER_NAME":/opt/ "$CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to copy /opt/ using docker cp. Skipping."
-        rm -rf "$TEMP_DIR"
+        ((FAILURES++))
         return 1
     fi
 
     # 3. Compress the copied /opt/ directory into a single tar.gz
     echo "  Compressing into $BACKUP_FILE..."
-    if ! tar czf "$BACKUP_FILE" -C "$TEMP_DIR" "${CONTAINER_NAME}_opt"; then
+    if ! tar czf "$TMP_BACKUP_FILE" -C "$CONTAINER_TEMP_DIR" "${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to create tar.gz archive. Skipping."
-        rm -rf "$TEMP_DIR"
+        rm -f "$TMP_BACKUP_FILE"
+        ((FAILURES++))
         return 1
     fi
+
+    # 4. Finalize backup (Atomic move and secure permissions)
+    mv "$TMP_BACKUP_FILE" "$BACKUP_FILE"
+    chmod 600 "$BACKUP_FILE"
     
-    # 4. Clean up
-    rm -rf "$TEMP_DIR"
+    # 5. Clean up container-specific temp dir
+    rm -rf "$CONTAINER_TEMP_DIR"
+
+    # 6. Apply retention policy
+    local BACKUP_PATTERN="$BACKUP_DIR/$CONTAINER_NAME-opt-*.tar.gz"
+    local OLD_BACKUPS=$(ls -t $BACKUP_PATTERN 2>/dev/null | tail -n +$((RETENTION_COUNT + 1)))
+    if [[ -n "$OLD_BACKUPS" ]]; then
+        echo "  Cleaning up old backups (keeping last $RETENTION_COUNT)..."
+        rm -f $OLD_BACKUPS
+    fi
+
     echo "  SUCCESS: Backup saved to $BACKUP_FILE"
     echo "--------------------------------------------------------"
     return 0
@@ -63,39 +110,48 @@ restore_container_opt() {
 
     if [[ -z "$LATEST_BACKUP" ]]; then
         echo "ERROR: No /opt/ backup found for $CONTAINER_NAME in $BACKUP_DIR. Skipping restore."
+        ((FAILURES++))
         return 1
     fi
 
     echo "--- Starting in-place /opt/ restore for $CONTAINER_NAME from $(basename "$LATEST_BACKUP") ---"
     
-    local TEMP_DIR=$(mktemp -d)
+    # TODO: Implement clean restores by wiping /opt/ in the container first.
+    # TODO: Implement rollback if restore fails.
+
+    local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/restore_${CONTAINER_NAME}_$DATE_SUFFIX"
+    mkdir -p "$CONTAINER_TEMP_DIR"
     
     echo "  Stopping container..."
     if ! docker stop "$CONTAINER_NAME"; then
         echo "  ERROR: Failed to stop $CONTAINER_NAME. Aborting restore."
+        ((FAILURES++))
         return 1
     fi
     
     echo "  Unpacking archive..."
-    if ! tar xzf "$LATEST_BACKUP" -C "$TEMP_DIR"; then
+    if ! tar xzf "$LATEST_BACKUP" -C "$CONTAINER_TEMP_DIR"; then
         echo "  ERROR: Failed to unpack backup. Aborting."
-        rm -rf "$TEMP_DIR"
         docker start "$CONTAINER_NAME" 2>/dev/null
+        ((FAILURES++))
         return 1
     fi
     
     echo "  Copying /opt/ content back into container..."
-    if docker cp "$TEMP_DIR/${CONTAINER_NAME}_opt/." "$CONTAINER_NAME:/opt/"; then
+    if docker cp "$CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt/." "$CONTAINER_NAME:/opt/"; then
         echo "  SUCCESS: /opt/ content updated."
     else
         echo "  ERROR: docker cp failed. Manual check required."
+        ((FAILURES++))
     fi
     
-    rm -rf "$TEMP_DIR"
+    # Clean up container-specific temp dir
+    rm -rf "$CONTAINER_TEMP_DIR"
     
     echo "  Starting container..."
     if ! docker start "$CONTAINER_NAME"; then
         echo "  WARNING: Failed to start $CONTAINER_NAME. Manual check required."
+        ((FAILURES++))
         return 1
     fi
     
@@ -148,4 +204,10 @@ else
     done
 fi
 
+if [[ $FAILURES -gt 0 ]]; then
+    echo "COMPLETED with $FAILURES error(s)."
+    exit 1
+fi
+
+echo "COMPLETED SUCCESSFULLY."
 exit 0
