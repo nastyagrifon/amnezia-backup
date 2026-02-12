@@ -1,0 +1,47 @@
+name: Build Packages
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Ruby and FPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm zstd libarchive-tools
+          sudo gem install --no-document fpm
+
+      - name: Build Packages
+        run: |
+          # Извлекаем версию из тега (например, v1.0.1 -> 1.0.1)
+          VERSION=${GITHUB_REF_NAME#v}
+          
+          # Список форматов для сборки
+          FORMATS=("deb" "rpm" "pacman")
+          
+          for FMT in "${FORMATS[@]}"; do
+            fpm -s dir -t $FMT \
+              -n amnezia-backup \
+              -v $VERSION \
+              --description "Backup script for AmneziaVPN" \
+              --url "https://github.com/nastyagrifon/amnezia-backup" \
+              --license "MIT" \
+              -d "bash" -d "curl" \
+              amnezia-backup.sh=/usr/bin/amnezia-backup
+          done
+
+      - name: Upload Artifacts to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            *.deb
+            *.rpm
+            *.pkg.tar.zst
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
