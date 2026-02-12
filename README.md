@@ -32,10 +32,11 @@ You can override the default settings using environment variables:
 - `BACKUP_DIR`: Path to save backups (default: `./amnezia_opt_backups`)
 - `CONTAINER_PREFIX`: Prefix of containers to backup (default: `amnezia`)
 - `RETENTION_COUNT`: Number of old backups to keep (default: `5`)
+- `CONSISTENT_BACKUP`: If `true`, pauses the container during backup (default: `false`)
 
 Example:
 ```bash
-BACKUP_DIR="/mnt/backups" RETENTION_COUNT=10 ./amnezia-backup.sh
+CONSISTENT_BACKUP=true ./amnezia-backup.sh
 ```
 
 ## Features

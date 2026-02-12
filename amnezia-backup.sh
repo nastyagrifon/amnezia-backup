@@ -5,6 +5,7 @@ BACKUP_DIR="${BACKUP_DIR:-./amnezia_opt_backups}"
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-amnezia}"
 DATE_SUFFIX=$(date +%Y%m%d_%H%M%S)
 RETENTION_COUNT="${RETENTION_COUNT:-5}"
+CONSISTENT_BACKUP="${CONSISTENT_BACKUP:-false}"
 
 # --- BLACKLIST: Containers to be excluded from backup and restore ---
 # Only 'amnezia-dns' is blacklisted as per request.
@@ -55,25 +56,40 @@ backup_container_opt() {
     local CONTAINER_NAME="$1"
     local BACKUP_FILE="$BACKUP_DIR/$CONTAINER_NAME-opt-$DATE_SUFFIX.tar.gz"
     local TMP_BACKUP_FILE="$BACKUP_FILE.tmp"
+    local PAUSED=false
     
     echo "--- Starting /opt/ backup for $CONTAINER_NAME ---"
     
-    # TODO: Implement consistent backups by pausing/stopping the container
-    # during the copy if data integrity is critical.
+    # 1. Handle consistency if requested
+    if [[ "$CONSISTENT_BACKUP" == "true" ]]; then
+        echo "  Pausing container for consistency..."
+        if docker pause "$CONTAINER_NAME" &>/dev/null; then
+            PAUSED=true
+        else
+            echo "  WARNING: Failed to pause $CONTAINER_NAME. Proceeding with live backup."
+        fi
+    fi
 
-    # 1. Create temporary directory for extraction
+    # 2. Create temporary directory for extraction
     local CONTAINER_TEMP_DIR="$SCRIPT_TEMP_DIR/${CONTAINER_NAME}_$DATE_SUFFIX"
     mkdir -p "$CONTAINER_TEMP_DIR"
     
-    # 2. Copy /opt/ out of the container
+    # 3. Copy /opt/ out of the container
     echo "  Copying /opt/ from container..."
     if ! docker cp "$CONTAINER_NAME":/opt/ "$CONTAINER_TEMP_DIR/${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to copy /opt/ using docker cp. Skipping."
+        [[ "$PAUSED" == "true" ]] && docker unpause "$CONTAINER_NAME" &>/dev/null
         ((FAILURES++))
         return 1
     fi
 
-    # 3. Compress the copied /opt/ directory into a single tar.gz
+    # 4. Unpause as soon as copy is done
+    if [[ "$PAUSED" == "true" ]]; then
+        echo "  Unpausing container..."
+        docker unpause "$CONTAINER_NAME" &>/dev/null
+    fi
+
+    # 5. Compress the copied /opt/ directory into a single tar.gz
     echo "  Compressing into $BACKUP_FILE..."
     if ! tar czf "$TMP_BACKUP_FILE" -C "$CONTAINER_TEMP_DIR" "${CONTAINER_NAME}_opt"; then
         echo "  ERROR: Failed to create tar.gz archive. Skipping."
