@@ -1,10 +1,30 @@
 #!/bin/bash
 
+# Argument Parsing
+RESTORE_MODE=false
+PROVIDED_DIR=""
+
+for arg in "$@"; do
+    if [[ "$arg" == "-r" ]]; then
+        RESTORE_MODE=true
+    elif [[ -z "$PROVIDED_DIR" ]]; then
+        PROVIDED_DIR="$arg"
+    fi
+done
+
 # Configuration
-BACKUP_DIR="${BACKUP_DIR:-./amnezia_opt_backups}"
+if [[ -n "$PROVIDED_DIR" ]]; then
+    # Create directory if it doesn't exist so we can get absolute path
+    mkdir -p "$PROVIDED_DIR"
+    BACKUP_DIR="$(cd "$PROVIDED_DIR" && pwd)"
+else
+    BACKUP_DIR="$(pwd)"
+fi
+
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-amnezia}"
 DATE_SUFFIX=$(date +%Y%m%d_%H%M%S)
 RETENTION_COUNT="${RETENTION_COUNT:-5}"
+ROLLBACK_RETENTION_COUNT="${ROLLBACK_RETENTION_COUNT:-2}"
 CONSISTENT_BACKUP="${CONSISTENT_BACKUP:-false}"
 
 # --- BLACKLIST: Containers to be excluded from backup and restore ---
@@ -18,12 +38,27 @@ FAILURES=0
 
 # Check dependencies
 check_dependencies() {
-    for cmd in docker tar; do
+    for cmd in docker tar awk df; do
         if ! command -v "$cmd" &> /dev/null; then
             echo "ERROR: Required command '$cmd' not found. Please install it."
             exit 1
         fi
     done
+    if ! docker info &> /dev/null; then
+        echo "ERROR: Cannot connect to Docker daemon. Check permissions (sudo?)."
+        exit 1
+    fi
+}
+
+# Check disk space (minimum 100MB)
+check_disk_space() {
+    local REQUIRED_KB=102400
+    mkdir -p "$BACKUP_DIR"
+    local AVAILABLE_KB=$(df -Pk "$BACKUP_DIR" | tail -1 | awk '{print $4}')
+    if [[ $AVAILABLE_KB -lt $REQUIRED_KB ]]; then
+        echo "ERROR: Insufficient disk space in $BACKUP_DIR (less than 100MB available)."
+        exit 1
+    fi
 }
 
 # Cleanup on exit
@@ -51,6 +86,27 @@ is_blacklisted() {
     return 1 # False (not blacklisted)
 }
 
+# Robust retention policy
+apply_retention() {
+    local CONTAINER_NAME="$1"
+    
+    # Regular backups
+    ls -t "$BACKUP_DIR/$CONTAINER_NAME-opt-"*.tar.gz 2>/dev/null | grep -v "pre-restore" | tail -n +$((RETENTION_COUNT + 1)) | while read -r old_file; do
+        if [[ -f "$old_file" ]]; then
+            echo "  Cleaning up old backup: $(basename "$old_file")"
+            rm -f "$old_file"
+        fi
+    done
+
+    # Pre-restore backups
+    ls -t "$BACKUP_DIR/$CONTAINER_NAME-opt-pre-restore-"*.tar.gz 2>/dev/null | tail -n +$((ROLLBACK_RETENTION_COUNT + 1)) | while read -r old_file; do
+        if [[ -f "$old_file" ]]; then
+            echo "  Cleaning up old safety backup: $(basename "$old_file")"
+            rm -f "$old_file"
+        fi
+    done
+}
+
 # Function to perform the actual /opt/ backup for a single container
 backup_container_opt() {
     local CONTAINER_NAME="$1"
@@ -61,6 +117,9 @@ backup_container_opt() {
     
     echo "--- Starting /opt/ backup for $CONTAINER_NAME ---"
     
+    # Check disk space before starting each backup
+    check_disk_space
+
     # 1. Handle consistency if requested
     if [[ "$CONSISTENT_BACKUP" == "true" ]]; then
         echo "  Pausing container for consistency..."
@@ -106,16 +165,8 @@ backup_container_opt() {
     # 5. Clean up container-specific temp dir
     rm -rf "$CONTAINER_TEMP_DIR"
 
-    # 6. Apply retention policy (only for regular backups)
-    if [[ "$SUFFIX" == "$DATE_SUFFIX" ]]; then
-        local BACKUP_PATTERN="$BACKUP_DIR/$CONTAINER_NAME-opt-*.tar.gz"
-        # Filter out rollback backups from retention policy to be safe
-        local OLD_BACKUPS=$(ls -t $BACKUP_PATTERN 2>/dev/null | grep -v "pre-restore" | tail -n +$((RETENTION_COUNT + 1)))
-        if [[ -n "$OLD_BACKUPS" ]]; then
-            echo "  Cleaning up old backups (keeping last $RETENTION_COUNT)..."
-            rm -f $OLD_BACKUPS
-        fi
-    fi
+    # 6. Apply retention policy
+    apply_retention "$CONTAINER_NAME"
 
     echo "  SUCCESS: Backup saved to $BACKUP_FILE"
     echo "--------------------------------------------------------"
@@ -213,9 +264,10 @@ if [[ ${#FILTERED_NAMES_ARRAY[@]} -eq 0 ]]; then
 fi
 
 # Determine if running in restore or backup mode
-if [[ "$1" == "-r" ]]; then
+if [[ "$RESTORE_MODE" == "true" ]]; then
     # RESTORE MODE
     echo "--- Amnezia Docker Restore Mode (Simplified /opt/ Restore) ---"
+    echo "Backup Directory: $BACKUP_DIR"
     echo "Containers to restore (excluding: ${BLACKLIST[*]}):"
     printf " - %s\n" "${FILTERED_NAMES_ARRAY[@]}"
     echo "--------------------------------------------------------"
@@ -226,6 +278,7 @@ if [[ "$1" == "-r" ]]; then
 else
     # BACKUP MODE (Default)
     echo "--- Amnezia Docker Backup Mode (Simplified /opt/ Backup) ---"
+    echo "Backup Directory: $BACKUP_DIR"
     mkdir -p "$BACKUP_DIR"
     echo "Containers to backup (excluding: ${BLACKLIST[*]}):"
     printf " - %s\n" "${FILTERED_NAMES_ARRAY[@]}"
